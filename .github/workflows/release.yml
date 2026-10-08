@@ -72,7 +72,6 @@ jobs:
       - name: Fetch assets and stage 9Router
         run: |
           python scripts/fetch_assets.py
-          npm install -g n9router
           python scripts/bundle_9router.py
 
       - name: Build Windows Portable App

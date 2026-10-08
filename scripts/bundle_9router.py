@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Stage and package the 9Router binary into app/bin for portable Windows distribution.
+"""Stage and bundle 9Router for portable Windows distribution.
 
-Supports:
-1. Pre-existing binary in app/bin/9router.exe or app/bin/9router
-2. Custom path from ROUTER_BINARY_PATH environment variable or --binary argument
-3. Packaging via npx @yao-pkg/pkg or npm if Node.js is available
+Ensures that 9Router runs portably using the official 64-bit node.exe runtime
+and the bundled 9router package in app/bin, preventing invalid 16-bit application
+errors.
 """
 
 from __future__ import annotations
@@ -14,90 +13,116 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 BIN_DIR = SKILL_ROOT / "app" / "bin"
+NODE_WIN64_URL = "https://nodejs.org/dist/v20.18.0/win-x64/node.exe"
 
 
-def get_binary_target() -> Path:
-    name = "9router.exe" if sys.platform == "win32" else "9router"
-    return BIN_DIR / name
-
-
-def stage_from_path(source_path: Path) -> bool:
-    if not source_path.is_file():
-        print(f"Error: Specified source binary does not exist: {source_path}", file=sys.stderr)
+def is_valid_pe(path: Path) -> bool:
+    """Verify that a Windows executable is a genuine PE binary (starts with 'MZ')."""
+    try:
+        if not path.is_file() or path.stat().st_size < 100 * 1024:
+            return False
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except Exception:
         return False
 
-    target = get_binary_target()
+
+def clean_invalid_binaries() -> None:
+    """Remove any invalid stub or non-PE 9router.exe from previous builds."""
+    target = BIN_DIR / "9router.exe"
+    if target.is_file() and not is_valid_pe(target):
+        print(f"Removing invalid non-PE executable stub: {target}")
+        try:
+            target.unlink()
+        except OSError:
+            pass
+
+
+def ensure_node_exe() -> bool:
+    """Download official standalone 64-bit node.exe if not present."""
+    target = BIN_DIR / "node.exe"
+    if target.is_file() and is_valid_pe(target):
+        print(f"Valid 64-bit node.exe already present: {target} ({target.stat().st_size / 1e6:.1f} MB)")
+        return True
+
+    print(f"Downloading official 64-bit node.exe from {NODE_WIN64_URL}...")
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source_path, target)
+    try:
+        urllib.request.urlretrieve(NODE_WIN64_URL, target)
+        if is_valid_pe(target):
+            print(f"Downloaded node.exe successfully ({target.stat().st_size / 1e6:.1f} MB)")
+            return True
+        print("Error: Downloaded node.exe is not a valid PE binary.", file=sys.stderr)
+        target.unlink(missing_ok=True)
+        return False
+    except Exception as error:
+        print(f"Failed to download node.exe: {error}", file=sys.stderr)
+        return False
+
+
+def ensure_9router_package() -> bool:
+    """Install the 9router pure-JS package into app/bin/9router."""
+    cli_js = BIN_DIR / "9router" / "node_modules" / "9router" / "cli.js"
+    if cli_js.is_file():
+        print(f"9Router package already present: {cli_js}")
+        return True
+
+    npm = shutil.which("npm")
+    if not npm:
+        print("Notice: 'npm' command not found. Cannot auto-install 9router package.", file=sys.stderr)
+        return False
+
+    print("Installing 9router package into app/bin/9router...")
+    target_dir = BIN_DIR / "9router"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cmd = [npm, "install", "--prefix", str(target_dir), "9router", "--no-audit", "--no-fund", "--omit=dev"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0 and cli_js.is_file():
+            print("Successfully installed 9router package into app/bin/9router.")
+            return True
+        print(f"npm install failed: {res.stderr}", file=sys.stderr)
+        return False
+    except Exception as error:
+        print(f"Failed to install 9router package: {error}", file=sys.stderr)
+        return False
+
+
+def stage_custom_binary(source: Path) -> bool:
+    if not source.is_file():
+        print(f"Error: Specified binary does not exist: {source}", file=sys.stderr)
+        return False
+    if sys.platform == "win32" and not is_valid_pe(source):
+        print(f"Error: Specified binary '{source}' is not a valid 64-bit Windows PE executable.", file=sys.stderr)
+        return False
+
+    target = BIN_DIR / ("9router.exe" if sys.platform == "win32" else "9router")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
     target.chmod(0o755)
-    print(f"Successfully staged {source_path} -> {target} ({target.stat().st_size / 1e6:.1f} MB)")
+    print(f"Staged custom binary: {target} ({target.stat().st_size / 1e6:.1f} MB)")
     return True
 
 
-def stage_from_system() -> bool:
-    target = get_binary_target()
-    if target.is_file():
-        print(f"9Router binary already present: {target} ({target.stat().st_size / 1e6:.1f} MB)")
-        return True
-
-    # Check environment variable
-    env_path = os.environ.get("ROUTER_BINARY_PATH")
-    if env_path:
-        return stage_from_path(Path(env_path))
-
-    # Check system PATH for 9router or n9router
-    for cmd in ("9router", "n9router", "9router.exe", "n9router.exe"):
-        found = shutil.which(cmd)
-        if found:
-            print(f"Found system {cmd} at {found}, copying to {target}...")
-            return stage_from_path(Path(found))
-
-    # Attempt to compile with npx @yao-pkg/pkg if npm/npx is available
-    npx = shutil.which("npx")
-    if npx:
-        print("Attempting to package 9Router via npx pkg...")
-        target_platform = "node18-win-x64" if sys.platform == "win32" else "node18-linux-x64"
-        try:
-            BIN_DIR.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                npx,
-                "-y",
-                "@yao-pkg/pkg",
-                "9router",
-                "--targets",
-                target_platform,
-                "--output",
-                str(target),
-            ]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            if res.returncode == 0 and target.is_file():
-                print(f"Compiled standalone binary to {target} ({target.stat().st_size / 1e6:.1f} MB)")
-                return True
-        except Exception as error:
-            print(f"Notice: Automated npx packaging was skipped: {error}")
-
-    print(
-        f"Notice: No 9Router binary staged at {target}.\n"
-        "To bundle 9Router into the portable package, place your pre-compiled\n"
-        f"binary at '{target}' or specify ROUTER_BINARY_PATH.",
-        file=sys.stderr,
-    )
-    return False
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Stage 9Router binary into app/bin")
-    parser.add_argument("--binary", type=Path, help="Path to pre-compiled 9Router executable")
+    parser = argparse.ArgumentParser(description="Stage 9Router for portable distribution")
+    parser.add_argument("--binary", type=Path, help="Path to pre-compiled standalone executable")
     args = parser.parse_args()
 
-    if args.binary:
-        return 0 if stage_from_path(args.binary) else 1
+    clean_invalid_binaries()
 
-    stage_from_system()
+    if args.binary:
+        return 0 if stage_custom_binary(args.binary) else 1
+
+    # On Windows or cross-building for Windows
+    ensure_node_exe()
+    ensure_9router_package()
+
     return 0
 
 

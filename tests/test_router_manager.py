@@ -27,11 +27,31 @@ class TestNineRouterManager(unittest.TestCase):
     def test_find_binary_in_app_bin(self) -> None:
         binary_name = "9router.exe" if sys.platform == "win32" else "9router"
         fake_binary = self.bin_dir / binary_name
-        fake_binary.write_text("#!/bin/sh\nexit 0\n")
+        # On Windows, real PE binary starts with MZ and must be >= 10KB
+        payload = b"MZ" + b"\x00" * 20000 if sys.platform == "win32" else b"#!/bin/sh\nexit 0\n"
+        fake_binary.write_bytes(payload)
         fake_binary.chmod(0o755)
 
         found = self.manager.find_binary()
         self.assertEqual(found, fake_binary)
+
+    def test_find_command_bundled_node(self) -> None:
+        node_name = "node.exe" if sys.platform == "win32" else "node"
+        fake_node = self.bin_dir / node_name
+        payload = b"MZ" + b"\x00" * 20000 if sys.platform == "win32" else b"#!/bin/sh\nexit 0\n"
+        fake_node.write_bytes(payload)
+        fake_node.chmod(0o755)
+
+        script = self.bin_dir / "9router" / "node_modules" / "9router" / "cli.js"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("// cli entry", encoding="utf-8")
+
+        cmd_info = self.manager.find_command()
+        self.assertIsNotNone(cmd_info)
+        args, use_shell = cmd_info
+        self.assertEqual(args[0], str(fake_node))
+        self.assertEqual(args[1], str(script))
+        self.assertFalse(use_shell)
 
     def test_find_binary_not_found(self) -> None:
         with mock.patch("shutil.which", return_value=None):

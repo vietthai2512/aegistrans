@@ -27,11 +27,12 @@ for optional in ("app/fonts", "app/assets", "app/bin"):
     directory = ROOT / optional
     if not directory.is_dir():
         continue
-    for item in sorted(directory.iterdir()):
+    for item in sorted(directory.rglob("*")):
         # onnxruntime caches a hardware-specific optimised graph next to the
         # model. It is 75 MB, and it is only valid on the machine that built it.
         if item.is_file() and item.suffix != ".optimized":
-            datas.append((str(item), optional))
+            rel_folder = str(item.parent.relative_to(ROOT))
+            datas.append((str(item), rel_folder))
 
 # Bundle medical specialty profiles
 profiles_dir = ROOT / "medical-translation" / "profiles"

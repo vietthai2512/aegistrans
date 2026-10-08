@@ -24,6 +24,19 @@ DEFAULT_ROUTER_URL = "http://localhost:20128"
 DEFAULT_MODEL = "ag/gemini-3.8-flash-low"
 
 
+def is_pe_binary(path: Path) -> bool:
+    """Check if file has Windows PE magic header (b'MZ') and is a valid executable."""
+    if sys.platform != "win32":
+        return True
+    try:
+        if not path.is_file() or path.stat().st_size < 10 * 1024:
+            return False
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except Exception:
+        return False
+
+
 class NineRouterManager:
     """Manages the bundled 9Router background process and its API connection."""
 
@@ -42,10 +55,11 @@ class NineRouterManager:
         self.process: subprocess.Popen[Any] | None = None
         self.spawned_by_us: bool = False
 
-    def find_binary(self) -> Path | None:
-        """Locate the 9Router executable binary."""
-        binary_name = "9router.exe" if sys.platform == "win32" else "9router"
+    def find_command(self) -> tuple[list[str], bool] | None:
+        """Resolve command args and shell mode to launch 9Router safely.
 
+        Returns (args_list, use_shell) or None if no valid runner is available.
+        """
         candidate_dirs = [
             self.app_root / "app" / "bin",
             self.app_root / "bin",
@@ -53,19 +67,57 @@ class NineRouterManager:
             Path(sys.executable).parent / "bin",
         ]
 
-        for directory in candidate_dirs:
-            candidate = directory / binary_name
-            if candidate.is_file() and os.access(candidate, os.X_OK | os.R_OK):
-                return candidate
-            # On Windows, sometimes file permissions aren't executable flag
-            if sys.platform == "win32" and candidate.is_file():
-                return candidate
+        # 1. Bundled portable node.exe (or node) + 9router/cli.js
+        node_name = "node.exe" if sys.platform == "win32" else "node"
+        for d in candidate_dirs:
+            node_candidate = d / node_name
+            is_valid_node = (
+                is_pe_binary(node_candidate) if sys.platform == "win32" else node_candidate.is_file()
+            )
+            if is_valid_node:
+                script_candidates = [
+                    d / "9router" / "node_modules" / "9router" / "cli.js",
+                    d / "9router" / "cli.js",
+                    d / "node_modules" / "9router" / "cli.js",
+                ]
+                for script in script_candidates:
+                    if script.is_file():
+                        return ([str(node_candidate), str(script), "-n", "--skip-update"], False)
 
-        # Check system PATH
-        system_binary = shutil.which("9router")
-        if system_binary:
-            return Path(system_binary)
+        # 2. Standalone 9router binary (must be verified PE on Windows)
+        binary_name = "9router.exe" if sys.platform == "win32" else "9router"
+        for d in candidate_dirs:
+            candidate = d / binary_name
+            if candidate.is_file():
+                if sys.platform == "win32":
+                    if is_pe_binary(candidate):
+                        return ([str(candidate), "-n", "--skip-update"], False)
+                elif os.access(candidate, os.X_OK | os.R_OK):
+                    return ([str(candidate), "-n", "--skip-update"], False)
 
+        # 3. System PATH
+        if sys.platform == "win32":
+            for cmd in ("9router.cmd", "n9router.cmd", "9router.bat", "n9router.bat"):
+                found = shutil.which(cmd)
+                if found:
+                    return ([found, "-n", "--skip-update"], True)
+            for cmd in ("9router.exe", "n9router.exe"):
+                found = shutil.which(cmd)
+                if found and is_pe_binary(Path(found)):
+                    return ([found, "-n", "--skip-update"], False)
+        else:
+            for cmd in ("9router", "n9router"):
+                found = shutil.which(cmd)
+                if found:
+                    return ([found, "-n", "--skip-update"], False)
+
+        return None
+
+    def find_binary(self) -> Path | None:
+        """Locate the 9Router executable binary (retained for backward compatibility)."""
+        cmd_info = self.find_command()
+        if cmd_info and cmd_info[0]:
+            return Path(cmd_info[0][0])
         return None
 
     def is_healthy(self, timeout: float = 1.0) -> bool:
@@ -84,23 +136,22 @@ class NineRouterManager:
             self.spawned_by_us = False
             return True
 
-        binary = self.find_binary()
-        if not binary:
-            logger.warning("No 9Router binary found in bundled directories or PATH.")
+        cmd_info = self.find_command()
+        if not cmd_info:
+            logger.info("No valid 9Router executable found; service will remain offline until started externally.")
             return False
 
-        logger.info("Starting bundled 9Router from %s", binary)
+        cmd_args, use_shell = cmd_info
+        logger.info("Starting bundled 9Router via: %s", cmd_args)
         try:
-            creationflags = 0
-            if sys.platform == "win32":
-                # CREATE_NO_WINDOW = 0x08000000
-                creationflags = 0x08000000
+            creationflags = 0x08000000 if sys.platform == "win32" else 0
 
             self.process = subprocess.Popen(
-                [str(binary)],
+                cmd_args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=creationflags,
+                shell=use_shell,
             )
             self.spawned_by_us = True
 
@@ -115,7 +166,7 @@ class NineRouterManager:
             logger.warning("9Router process started but health check timed out.")
             return False
         except Exception as error:
-            logger.error("Failed to launch 9Router binary: %s", error)
+            logger.error("Failed to launch 9Router: %s", error)
             return False
 
     def open_dashboard(self) -> None:
