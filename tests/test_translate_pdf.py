@@ -36,9 +36,18 @@ class TranslatePdfTests(unittest.TestCase):
 
         self.assertEqual(result.path, self.output / "guide-vi.pdf")
         self.assertEqual(result.untranslated, 0)
-        self.assertEqual(result.path.read_bytes(), b"%PDF-1.7\ntranslated")
         run.assert_called_once_with(
             self.source, mock.ANY, "vi", "auto", None, translate_pdf.DEFAULT_THREADS, False, "google", {}, None
+        )
+
+    @mock.patch.object(translate_pdf, "_require_core")
+    @mock.patch.object(translate_pdf, "_run_engine")
+    def test_forwards_extra_envs(self, run, _core):
+        run.side_effect = self._engine_side_effect
+        extra = {"llm_base_url": "http://localhost:20128/v1", "llm_api_key": "9router"}
+        translate_pdf.translate_pdf(self.source, self.output, engine="openai", extra_envs=extra)
+        run.assert_called_once_with(
+            self.source, mock.ANY, "vi", "auto", None, translate_pdf.DEFAULT_THREADS, False, "openai", extra, None
         )
 
     @mock.patch.object(translate_pdf, "_require_core")

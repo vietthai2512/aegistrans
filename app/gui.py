@@ -26,7 +26,9 @@ APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
+from app.router_manager import DEFAULT_MODEL, NineRouterManager  # noqa: E402
 from app.update import APP_VERSION, RELEASES_PAGE, check_for_update  # noqa: E402
+from pdf2zh.profiles import list_available_profiles, load_profile  # noqa: E402
 from scripts.translate_pdf import (  # noqa: E402
     DEFAULT_TARGET_LANGUAGE,
     TARGET_LANGUAGES,
@@ -34,6 +36,14 @@ from scripts.translate_pdf import (  # noqa: E402
     preload_layout_model,
     translate_pdf,
 )
+
+ENGINE_9ROUTER = "9Router AI (Y khoa chuyên sâu)"
+ENGINE_GOOGLE = "Google Translate (Bản nháp nhanh)"
+
+PROFILE_MAP = {
+    "Nha khoa & TMD (dental)": "dental",
+    "Y đa khoa & Dược (general_medicine)": "general_medicine",
+}
 
 FONT_DIRECTORY = APP_ROOT / "app" / "fonts"
 ASSET_DIRECTORY = APP_ROOT / "app" / "assets"
@@ -226,9 +236,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.mono_font = MONO_FONT if has_fonts else FALLBACK_MONO_FONT
 
         self.title("AegisTrans")
-        self.minsize(620, 580)
-        self._center(760, 700)
+        self.minsize(680, 620)
+        self._center(780, 720)
         self._set_window_icon()
+
+        self.router_manager = NineRouterManager(APP_ROOT)
+        self.router_models = [DEFAULT_MODEL]
 
         self.files: list[Path] = []
         self.rows: dict[Path, QueueRow] = {}
@@ -241,6 +254,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.last_output: Path | None = None
         self.outputs: dict[Path, Path] = {}
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self._build()
         if self.dnd_available:
             try:
@@ -251,15 +266,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             except Exception:
                 self.dnd_available = False
         self.after(100, self._drain_events)
-        # Both background threads are staggered: each one holds the GIL long
-        # enough while importing to make the freshly opened window hitch, and
-        # neither is urgent enough to do that to the first second of the app.
+        self.after(500, self._check_router_service)
         self.after(2000, lambda: threading.Thread(target=self._check_for_update, daemon=True).start())
-        # Build the inference session while the user is still picking files: it is
-        # ~0.9s that every first translation used to pay right after the button
-        # press, with nothing to show. Delayed, because starting it inside
-        # __init__ made the window itself hitch for half a second as it opened.
         self.after(800, lambda: threading.Thread(target=preload_layout_model, daemon=True).start())
+
+    def _on_close(self) -> None:
+        try:
+            self.router_manager.shutdown()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _check_router_service(self) -> None:
+        def worker():
+            running = self.router_manager.start()
+            is_auth = self.router_manager.is_authenticated() if running else False
+            models = self.router_manager.get_available_models() if running else []
+            self.events.put(("router_state", running, is_auth, models))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_engine_change(self, choice: str) -> None:
+        is_ai = (choice == ENGINE_9ROUTER)
+        state = "normal" if is_ai else "disabled"
+        self.profile_menu.configure(state=state)
+        self.model_menu.configure(state=state)
+        self.router_btn.configure(state=state)
 
     def _center(self, width: int, height: int) -> None:
         """Open in the middle of the screen. Letting Windows drop the window in
@@ -384,31 +415,85 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         controls = ctk.CTkFrame(self, corner_radius=12, fg_color=SURFACE)
         controls.grid(row=2, column=0, padx=EDGE, pady=GAP, sticky="ew")
         controls.grid_columnconfigure(1, weight=1)
+        controls.grid_columnconfigure(3, weight=1)
+
+        # Row 0: Chế độ dịch (Engine) + 9Router Status & Button
+        ctk.CTkLabel(
+            controls, text="Chế độ", font=ctk.CTkFont(self.ui_font, size=13, weight="bold")
+        ).grid(row=0, column=0, padx=(GAP, PAD), pady=(GAP, PAD // 2), sticky="w")
+
+        self.engine_menu = ctk.CTkOptionMenu(
+            controls, values=[ENGINE_9ROUTER, ENGINE_GOOGLE], width=210, height=32,
+            font=ctk.CTkFont(self.ui_font, size=12),
+            command=self._on_engine_change,
+        )
+        self.engine_menu.set(ENGINE_9ROUTER)
+        self.engine_menu.grid(row=0, column=1, pady=(GAP, PAD // 2), sticky="w")
+
+        self.router_badge = ctk.CTkLabel(
+            controls, text="● 9Router: Đang kiểm tra...", font=ctk.CTkFont(self.ui_font, size=11),
+            text_color=MUTED,
+        )
+        self.router_badge.grid(row=0, column=2, padx=(PAD, PAD), pady=(GAP, PAD // 2), sticky="e")
+
+        self.router_btn = ctk.CTkButton(
+            controls, text="Đăng nhập 9Router", width=120, height=28, corner_radius=6,
+            fg_color="transparent", border_width=1, border_color=BORDER_IDLE,
+            text_color=ACCENT, hover_color=HOVER,
+            font=ctk.CTkFont(self.ui_font, size=11, weight="bold"),
+            command=self.router_manager.open_dashboard,
+        )
+        self.router_btn.grid(row=0, column=3, padx=(0, GAP), pady=(GAP, PAD // 2), sticky="e")
+
+        # Row 1: Specialty Profile & Model selection
+        ctk.CTkLabel(
+            controls, text="Chuyên khoa", font=ctk.CTkFont(self.ui_font, size=12)
+        ).grid(row=1, column=0, padx=(GAP, PAD), pady=(PAD // 2, PAD // 2), sticky="w")
+
+        profile_labels = list(PROFILE_MAP.keys())
+        self.profile_menu = ctk.CTkOptionMenu(
+            controls, values=profile_labels, width=210, height=30,
+            font=ctk.CTkFont(self.ui_font, size=12),
+        )
+        self.profile_menu.set(profile_labels[0])  # Dental default
+        self.profile_menu.grid(row=1, column=1, pady=(PAD // 2, PAD // 2), sticky="w")
 
         ctk.CTkLabel(
-            controls, text="Dịch sang", font=ctk.CTkFont(self.ui_font, size=13)
-        ).grid(row=0, column=0, padx=(GAP, PAD + 2), pady=(GAP, PAD), sticky="w")
+            controls, text="Mô hình AI", font=ctk.CTkFont(self.ui_font, size=12)
+        ).grid(row=1, column=2, padx=(PAD, PAD), pady=(PAD // 2, PAD // 2), sticky="e")
+
+        self.model_menu = ctk.CTkOptionMenu(
+            controls, values=self.router_models, width=170, height=30,
+            font=ctk.CTkFont(self.ui_font, size=11),
+        )
+        self.model_menu.set(self.router_models[0])
+        self.model_menu.grid(row=1, column=3, padx=(0, GAP), pady=(PAD // 2, PAD // 2), sticky="ew")
+
+        # Row 2: Target Language, Overwrite, Translate Button
+        ctk.CTkLabel(
+            controls, text="Dịch sang", font=ctk.CTkFont(self.ui_font, size=12)
+        ).grid(row=2, column=0, padx=(GAP, PAD), pady=(PAD // 2, GAP), sticky="w")
 
         names = sorted(LANGUAGE_NAMES[code] for code in TARGET_LANGUAGES if code in LANGUAGE_NAMES)
         self.language = ctk.CTkOptionMenu(
-            controls, values=names, width=200, height=34,
-            font=ctk.CTkFont(self.ui_font, size=13),
-        )
-        self.language.set(LANGUAGE_NAMES[DEFAULT_TARGET_LANGUAGE])
-        self.language.grid(row=0, column=1, pady=(GAP, PAD), sticky="w")
-
-        self.translate_button = ctk.CTkButton(
-            controls, text="Dịch", width=124, height=40, corner_radius=8,
-            command=self._start, font=ctk.CTkFont(self.ui_font, size=14, weight="bold"),
-        )
-        self.translate_button.grid(row=0, column=2, rowspan=2, padx=GAP, pady=GAP)
-
-        self.overwrite = ctk.CTkCheckBox(
-            controls, text="Ghi đè file đã dịch trước đó",
-            checkbox_width=18, checkbox_height=18,
+            controls, values=names, width=140, height=32,
             font=ctk.CTkFont(self.ui_font, size=12),
         )
-        self.overwrite.grid(row=1, column=0, columnspan=2, padx=GAP, pady=(0, GAP), sticky="w")
+        self.language.set(LANGUAGE_NAMES[DEFAULT_TARGET_LANGUAGE])
+        self.language.grid(row=2, column=1, pady=(PAD // 2, GAP), sticky="w")
+
+        self.overwrite = ctk.CTkCheckBox(
+            controls, text="Ghi đè file cũ",
+            checkbox_width=16, checkbox_height=16,
+            font=ctk.CTkFont(self.ui_font, size=11),
+        )
+        self.overwrite.grid(row=2, column=2, padx=(PAD, PAD), pady=(PAD // 2, GAP), sticky="w")
+
+        self.translate_button = ctk.CTkButton(
+            controls, text="Dịch", width=120, height=36, corner_radius=8,
+            command=self._start, font=ctk.CTkFont(self.ui_font, size=13, weight="bold"),
+        )
+        self.translate_button.grid(row=2, column=3, padx=(0, GAP), pady=(PAD // 2, GAP), sticky="e")
 
     def _build_queue(self) -> None:
         # A separate header, because CTkScrollableFrame's label_text cannot hold
@@ -594,12 +679,36 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             text=f"Đang chuẩn bị {pages} trang…" if pages else "Đang chuẩn bị…"
         )
         self.batch_done, self.batch_total = 0, len(pending)
+        engine_choice = self.engine_menu.get()
+        profile_key = PROFILE_MAP.get(self.profile_menu.get(), "dental")
+        model_name = self.model_menu.get()
+
         self.worker = threading.Thread(
-            target=self._run, args=(pending, language, overwrite), daemon=True
+            target=self._run,
+            args=(pending, language, overwrite, engine_choice, profile_key, model_name),
+            daemon=True,
         )
         self.worker.start()
 
-    def _run(self, files: list[Path], language: str, overwrite: bool) -> None:
+    def _run(
+        self,
+        files: list[Path],
+        language: str,
+        overwrite: bool,
+        engine_choice: str = ENGINE_9ROUTER,
+        profile_key: str = "dental",
+        model_name: str = DEFAULT_MODEL,
+    ) -> None:
+        is_9router = (engine_choice == ENGINE_9ROUTER)
+        profile_assets = load_profile(profile_key, APP_ROOT) if is_9router else None
+        extra_envs = None
+        if is_9router:
+            extra_envs = {
+                "llm_base_url": self.router_manager.api_url,
+                "llm_api_key": "9router",
+                "llm_model": model_name,
+            }
+
         for index, path in enumerate(files, 1):
             self.events.put(("status", path, "running", "", None))
             destination = path.parent / "translated"
@@ -613,6 +722,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     destination,
                     target_language=language,
                     overwrite=overwrite,
+                    engine="openai" if is_9router else "google",
+                    system_prompt=profile_assets.system_prompt if profile_assets else None,
+                    glossary=profile_assets.glossary if profile_assets else None,
+                    extra_envs=extra_envs,
                     on_progress=report,
                 )
                 detail = (
@@ -697,6 +810,29 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             elif event[0] == "update":
                 self.update_link.configure(text=f"● Có bản mới {event[1]}")
                 self.update_link.grid()
+            elif event[0] == "router_state":
+                _, running, is_auth, models = event
+                if running:
+                    if models:
+                        self.router_models = models
+                        self.model_menu.configure(values=self.router_models)
+                        if self.model_menu.get() not in self.router_models:
+                            self.model_menu.set(self.router_models[0])
+                    if is_auth:
+                        self.router_badge.configure(
+                            text="● 9Router: Đã kết nối", text_color=STATUS_COLORS["done"]
+                        )
+                        self.router_btn.configure(text="Cài đặt 9Router")
+                    else:
+                        self.router_badge.configure(
+                            text="● 9Router: Cần đăng nhập", text_color=STATUS_COLORS["partial"]
+                        )
+                        self.router_btn.configure(text="Đăng nhập 9Router")
+                else:
+                    self.router_badge.configure(
+                        text="○ 9Router: Chưa kết nối", text_color=MUTED
+                    )
+                    self.router_btn.configure(text="Mở 9Router")
             elif event[0] == "finished":
                 self.translate_button.configure(state="normal", text="Dịch")
                 self.clear_button.configure(state="normal")

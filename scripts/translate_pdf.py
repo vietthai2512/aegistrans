@@ -320,11 +320,14 @@ def translate_pdf(
     system_prompt: Path | None = None,
     glossary: Path | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    extra_envs: dict[str, str] | None = None,
 ) -> Translation:
     """Translate one PDF, reporting any segments the engine could not translate."""
     _require_core()
     source = _validate_input(input_pdf)
     envs = _segment_envs(segments, emit_segments)
+    if extra_envs:
+        envs.update(extra_envs)
 
     if system_prompt is not None:
         prompt_path = system_prompt.expanduser().resolve()

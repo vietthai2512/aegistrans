@@ -23,7 +23,7 @@ if update_file.is_file():
             break
 
 datas = []
-for optional in ("app/fonts", "app/assets"):
+for optional in ("app/fonts", "app/assets", "app/bin"):
     directory = ROOT / optional
     if not directory.is_dir():
         continue
@@ -32,6 +32,14 @@ for optional in ("app/fonts", "app/assets"):
         # model. It is 75 MB, and it is only valid on the machine that built it.
         if item.is_file() and item.suffix != ".optimized":
             datas.append((str(item), optional))
+
+# Bundle medical specialty profiles
+profiles_dir = ROOT / "medical-translation" / "profiles"
+if profiles_dir.is_dir():
+    for item in sorted(profiles_dir.rglob("*")):
+        if item.is_file():
+            rel_folder = str(item.parent.relative_to(ROOT))
+            datas.append((str(item), rel_folder))
 
 datas += collect_data_files("customtkinter")
 datas += collect_data_files("tkinterdnd2")
@@ -43,6 +51,10 @@ hiddenimports = [
     "pdf2zh.high_level",
     "pdf2zh.converter",
     "pdf2zh.translator",
+    "pdf2zh.profiles",
+    "app.router_manager",
+    "requests",
+    "openai",
 ]
 
 analysis = Analysis(
