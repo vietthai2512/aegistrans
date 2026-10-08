@@ -18,7 +18,8 @@ from pathlib import Path
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 BIN_DIR = SKILL_ROOT / "app" / "bin"
-NODE_WIN64_URL = "https://nodejs.org/dist/v20.18.0/win-x64/node.exe"
+NODE_VERSION = "v22.23.3"
+NODE_WIN64_URL = f"https://nodejs.org/dist/{NODE_VERSION}/win-x64/node.exe"
 
 
 def is_valid_pe(path: Path) -> bool:
@@ -44,17 +45,25 @@ def clean_invalid_binaries() -> None:
 
 
 def ensure_node_exe() -> bool:
-    """Download official standalone 64-bit node.exe if not present."""
+    """Download official standalone 64-bit node.exe (Node 22 LTS with built-in node:sqlite)."""
     target = BIN_DIR / "node.exe"
+    stamp_file = BIN_DIR / "node_version.txt"
     if target.is_file() and is_valid_pe(target):
-        print(f"Valid 64-bit node.exe already present: {target} ({target.stat().st_size / 1e6:.1f} MB)")
-        return True
+        if stamp_file.is_file() and stamp_file.read_text().strip() == NODE_VERSION:
+            print(f"Valid 64-bit node.exe ({NODE_VERSION}) already present: {target} ({target.stat().st_size / 1e6:.1f} MB)")
+            return True
+        print(f"Existing node.exe is not {NODE_VERSION}. Re-downloading...")
+        try:
+            target.unlink()
+        except OSError:
+            pass
 
-    print(f"Downloading official 64-bit node.exe from {NODE_WIN64_URL}...")
+    print(f"Downloading official 64-bit node.exe ({NODE_VERSION}) from {NODE_WIN64_URL}...")
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     try:
         urllib.request.urlretrieve(NODE_WIN64_URL, target)
         if is_valid_pe(target):
+            stamp_file.write_text(NODE_VERSION)
             print(f"Downloaded node.exe successfully ({target.stat().st_size / 1e6:.1f} MB)")
             return True
         print("Error: Downloaded node.exe is not a valid PE binary.", file=sys.stderr)
@@ -66,10 +75,11 @@ def ensure_node_exe() -> bool:
 
 
 def ensure_9router_package() -> bool:
-    """Install the 9router pure-JS package into app/bin/9router."""
+    """Install the 9router and sql.js packages into app/bin/9router."""
     cli_js = BIN_DIR / "9router" / "node_modules" / "9router" / "cli.js"
-    if cli_js.is_file():
-        print(f"9Router package already present: {cli_js}")
+    sql_js = BIN_DIR / "9router" / "node_modules" / "sql.js"
+    if cli_js.is_file() and sql_js.is_dir():
+        print(f"9Router and sql.js packages already present: {cli_js}")
         return True
 
     npm = shutil.which("npm")
@@ -77,14 +87,14 @@ def ensure_9router_package() -> bool:
         print("Notice: 'npm' command not found. Cannot auto-install 9router package.", file=sys.stderr)
         return False
 
-    print("Installing 9router package into app/bin/9router...")
+    print("Installing 9router and sql.js packages into app/bin/9router...")
     target_dir = BIN_DIR / "9router"
     target_dir.mkdir(parents=True, exist_ok=True)
     try:
-        cmd = [npm, "install", "--prefix", str(target_dir), "9router", "--no-audit", "--no-fund", "--omit=dev"]
+        cmd = [npm, "install", "--prefix", str(target_dir), "9router", "sql.js@1.14.1", "--no-audit", "--no-fund", "--omit=dev"]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0 and cli_js.is_file():
-            print("Successfully installed 9router package into app/bin/9router.")
+            print("Successfully installed 9router and sql.js packages into app/bin/9router.")
             return True
         print(f"npm install failed: {res.stderr}", file=sys.stderr)
         return False

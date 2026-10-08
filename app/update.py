@@ -8,7 +8,7 @@ for that, pointing at the release page is the whole feature.
 
 from __future__ import annotations
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 REPOSITORY = "vietthai2512/aegistrans"
 RELEASES_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPOSITORY}/releases/latest"
