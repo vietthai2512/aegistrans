@@ -343,6 +343,13 @@ def translate_pdf(
     if output_dir is not None:
         destination_dir = output_dir.expanduser().resolve()
         destination_dir.mkdir(parents=True, exist_ok=True)
+        # Keep all SQLite caches strictly inside the document output folder
+        os.environ["PDF2ZH_CACHE_DIR"] = str(destination_dir)
+        try:
+            from pdf2zh.cache import init_db
+            init_db(destination_dir)
+        except Exception:
+            pass
         destination = destination_dir / f"{source.stem}-{target_language}.pdf"
         if destination.exists() and not overwrite:
             raise TranslationError(

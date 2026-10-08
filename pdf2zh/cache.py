@@ -91,21 +91,33 @@ class TranslationCache:
             logger.debug(f"Error setting cache: {e}")
 
 
-def init_db(remove_exists=False):
-    cache_folder = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh")
+def init_db(cache_folder=None, remove_exists=False):
+    if not cache_folder:
+        cache_folder = os.environ.get("PDF2ZH_CACHE_DIR")
+    if not cache_folder:
+        # Avoid creating external ~/.cache directory.
+        # Use in-memory SQLite until a document output directory is specified.
+        db.init(":memory:")
+        db.create_tables([_TranslationCache], safe=True)
+        return
+
+    cache_folder = str(cache_folder)
     os.makedirs(cache_folder, exist_ok=True)
-    # The current version does not support database migration, so add the version number to the file name.
+    # Store cache.v1.db strictly inside the document output directory
     cache_db_path = os.path.join(cache_folder, "cache.v1.db")
     if remove_exists and os.path.exists(cache_db_path):
         os.remove(cache_db_path)
-    db.init(
-        cache_db_path,
-        pragmas={
-            "journal_mode": "wal",
-            "busy_timeout": 1000,
-        },
-    )
-    db.create_tables([_TranslationCache], safe=True)
+    if getattr(db, "database", None) != cache_db_path:
+        if not db.is_closed():
+            db.close()
+        db.init(
+            cache_db_path,
+            pragmas={
+                "journal_mode": "wal",
+                "busy_timeout": 1000,
+            },
+        )
+        db.create_tables([_TranslationCache], safe=True)
 
 
 def init_test_db():

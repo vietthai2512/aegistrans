@@ -32,6 +32,7 @@ except ImportError:
     pass
 
 from scripts.translate_pdf import (
+    Translation,
     TranslationError,
     translate_pdf,
     _use_utf8_output,
@@ -94,6 +95,7 @@ def step_extract_segments(
     pages: str | None = None,
     threads: int = 4,
     overwrite: bool = False,
+    on_progress: object = None,
 ) -> tuple[int, float, bool]:
     """Extract translatable segments from PDF using handoff engine pass 1.
 
@@ -119,6 +121,7 @@ def step_extract_segments(
         engine="handoff",
         emit_segments=segments_path,
         overwrite=True,
+        on_progress=on_progress,
     )
 
     elapsed = time.perf_counter() - t0
@@ -140,6 +143,8 @@ def step_translate_segments(
     request_interval: float = 0.5,
     batch_size: int = 50,
     force_retranslate: bool = False,
+    extra_envs: dict[str, str] | None = None,
+    on_progress: object = None,
 ) -> tuple[dict, float]:
     """Translate segments via OpenAI-compatible LLM with checkpointing.
 
@@ -182,10 +187,11 @@ def step_translate_segments(
 
     # Check existing progress
     stats = checkpoint.get_stats()
-    if stats.get("completed", 0) > 0:
+    completed_prev = stats.get("completed", 0)
+    if completed_prev > 0:
         logger.info(
             "Resuming: %d/%d already completed, %d failed",
-            stats.get("completed", 0), stats["total"], stats.get("failed", 0),
+            completed_prev, stats["total"], stats.get("failed", 0),
         )
 
     # Get pending segments
@@ -196,9 +202,13 @@ def step_translate_segments(
         total_stats = checkpoint.get_stats()
         checkpoint.close()
         elapsed = time.perf_counter() - t0
+        if on_progress:
+            on_progress(len(segments), len(segments))
         return total_stats, elapsed
 
-    logger.info("Segments to translate: %d", len(pending))
+    logger.info("Segments to translate: %d (already finished: %d)", len(pending), completed_prev)
+    if on_progress:
+        on_progress(completed_prev, len(segments))
 
     # Initialize OpenAI translator
     from pdf2zh.translator import OpenAITranslator, remove_control_characters
@@ -208,6 +218,14 @@ def step_translate_segments(
         envs["system_prompt"] = str(system_prompt.resolve())
     if glossary and glossary.is_file():
         envs["glossary"] = str(glossary.resolve())
+    if extra_envs:
+        envs.update(extra_envs)
+        if "llm_model" in extra_envs:
+            os.environ["LLM_MODEL"] = extra_envs["llm_model"]
+        if "llm_base_url" in extra_envs:
+            os.environ["LLM_BASE_URL"] = extra_envs["llm_base_url"]
+        if "llm_api_key" in extra_envs:
+            os.environ["LLM_API_KEY"] = extra_envs["llm_api_key"]
 
     translator = OpenAITranslator(
         lang_in="en",
@@ -322,6 +340,10 @@ def step_translate_segments(
                         cur_trans = translated_count
                         cur_fail = failed_count
 
+                    total_done = completed_prev + done
+                    if on_progress:
+                        on_progress(total_done, len(segments))
+
                     if done % 10 == 0 or done == total_pending:
                         elapsed_so_far = time.perf_counter() - start_time
                         rate = done / elapsed_so_far if elapsed_so_far > 0 else 0
@@ -338,6 +360,10 @@ def step_translate_segments(
                     done = translated_count + failed_count
                     cur_trans = translated_count
                     cur_fail = failed_count
+
+                total_done = completed_prev + done
+                if on_progress:
+                    on_progress(total_done, len(segments))
 
                 if done % 10 == 0 or done == total_pending:
                     elapsed_so_far = time.perf_counter() - start_time
@@ -378,6 +404,7 @@ def step_rebuild_pdf(
     pages: str | None = None,
     threads: int = 4,
     overwrite: bool = False,
+    on_progress: object = None,
 ) -> tuple[Path | None, float]:
     """Rebuild the translated PDF using handoff engine pass 2.
 
@@ -404,6 +431,7 @@ def step_rebuild_pdf(
         segments=translations_path,
         emit_segments=still_missing_path,
         overwrite=overwrite,
+        on_progress=on_progress,
     )
 
     elapsed = time.perf_counter() - t0
@@ -428,6 +456,144 @@ def step_rebuild_pdf(
     return result.path, elapsed
 
 
+def translate_book_pipeline(
+    input_pdf: Path,
+    output_dir: Path,
+    *,
+    target_language: str = "vi",
+    source_language: str = "auto",
+    pages: str | None = None,
+    threads: int = 4,
+    concurrency: int = 2,
+    request_interval: float = 0.2,
+    batch_size: int = 50,
+    max_retries: int = 3,
+    profile: str | None = "dental",
+    system_prompt: Path | None = None,
+    glossary: Path | None = None,
+    extra_envs: dict[str, str] | None = None,
+    overwrite: bool = False,
+    force_retranslate: bool = False,
+    skip_rebuild: bool = False,
+    on_progress: object = None,
+) -> Translation:
+    """End-to-end book translation pipeline with checkpointing.
+
+    1. Extracts segments into segments.jsonl
+    2. Translates segments into checkpoint.db & translations.jsonl
+    3. Rebuilds the final translated PDF into output_dir
+
+    All cache and checkpoints are kept strictly inside output_dir.
+    """
+    input_pdf = input_pdf.expanduser().resolve()
+    if not input_pdf.is_file():
+        raise TranslationError(f"Input PDF does not exist: {input_pdf}")
+
+    output_dir = output_dir.expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Strictly bind all cache to output_dir
+    os.environ["PDF2ZH_CACHE_DIR"] = str(output_dir)
+    try:
+        from pdf2zh.cache import init_db
+        init_db(output_dir)
+    except Exception:
+        pass
+
+    segments_path = output_dir / "segments.jsonl"
+    translations_path = output_dir / "translations.jsonl"
+    checkpoint_path = output_dir / "checkpoint.db"
+    still_missing_path = output_dir / "still_missing.jsonl"
+
+    profile_assets = None
+    if profile:
+        profile_assets = load_profile(profile, root=SKILL_ROOT)
+
+    resolved_prompt = system_prompt
+    if not resolved_prompt and profile_assets and profile_assets.system_prompt:
+        resolved_prompt = profile_assets.system_prompt
+
+    resolved_glossary = glossary
+    if not resolved_glossary and profile_assets and profile_assets.glossary:
+        resolved_glossary = profile_assets.glossary
+
+    if force_retranslate:
+        for p in (segments_path, translations_path, checkpoint_path):
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
+    # Step 1: Extraction
+    def _extract_cb(done: int, total: int) -> None:
+        if callable(on_progress):
+            on_progress("extracting", done, total)
+
+    segment_count, t1_elapsed, cached = step_extract_segments(
+        input_pdf,
+        output_dir,
+        segments_path,
+        target_language=target_language,
+        source_language=source_language,
+        pages=pages,
+        threads=threads,
+        overwrite=overwrite or force_retranslate,
+        on_progress=_extract_cb,
+    )
+
+    if segment_count == 0:
+        dest_pdf = output_dir / f"{input_pdf.stem}-{target_language}.pdf"
+        import shutil
+        shutil.copyfile(input_pdf, dest_pdf)
+        return Translation(dest_pdf, 0)
+
+    # Step 2: Translation with checkpoint
+    def _translate_cb(done: int, total: int) -> None:
+        if callable(on_progress):
+            on_progress("translating", done, total)
+
+    stats, t2_elapsed = step_translate_segments(
+        segments_path,
+        output_dir,
+        translations_path,
+        checkpoint_path,
+        system_prompt=resolved_prompt,
+        glossary=resolved_glossary,
+        concurrency=concurrency,
+        max_retries=max_retries,
+        request_interval=request_interval,
+        batch_size=batch_size,
+        force_retranslate=force_retranslate,
+        extra_envs=extra_envs,
+        on_progress=_translate_cb,
+    )
+
+    if skip_rebuild:
+        return Translation(None, 0)
+
+    # Step 3: Rebuild
+    def _rebuild_cb(done: int, total: int) -> None:
+        if callable(on_progress):
+            on_progress("rebuilding", done, total)
+
+    result_path, t3_elapsed = step_rebuild_pdf(
+        input_pdf,
+        output_dir,
+        translations_path,
+        still_missing_path,
+        target_language=target_language,
+        source_language=source_language,
+        pages=pages,
+        threads=threads,
+        overwrite=overwrite,
+        on_progress=_rebuild_cb,
+    )
+
+    failed = stats.get("failed", 0)
+    return Translation(result_path, failed)
+
+
 def main(argv=None) -> int:
     _use_utf8_output()
     total_start = time.perf_counter()
@@ -441,144 +607,30 @@ def main(argv=None) -> int:
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # File paths
-    segments_path = output_dir / "segments.jsonl"
-    translations_path = output_dir / "translations.jsonl"
-    checkpoint_path = output_dir / "checkpoint.db"
-    still_missing_path = output_dir / "still_missing.jsonl"
-
-    # Resolve profile defaults if system_prompt or glossary not explicitly given
-    profile_assets = None
-    if args.profile:
-        profile_assets = load_profile(args.profile, root=SKILL_ROOT)
-        if not profile_assets:
-            available = ", ".join(list_available_profiles(SKILL_ROOT))
-            logger.warning(
-                "Profile '%s' not found. Available profiles in medical-translation/profiles/: [%s]",
-                args.profile, available,
-            )
-
-    system_prompt = args.system_prompt
-    if not system_prompt and profile_assets and profile_assets.system_prompt:
-        system_prompt = profile_assets.system_prompt
-
-    glossary = args.glossary
-    if not glossary and profile_assets and profile_assets.glossary:
-        glossary = profile_assets.glossary
-
-    logger.info("=" * 60)
-    logger.info("Book Translation Pipeline")
-    logger.info("Input: %s", input_pdf)
-    logger.info("Output: %s", output_dir)
-    logger.info("Profile: %s (%s)", args.profile, profile_assets.dir_path if profile_assets else "custom/none")
-    logger.info("System Prompt: %s", system_prompt)
-    logger.info("Glossary: %s", glossary)
-    logger.info("Model: %s", os.environ.get("LLM_MODEL", "default"))
-    logger.info("Concurrency: %d (request interval: %.2fs)", args.concurrency, args.request_interval)
-    logger.info("=" * 60)
-
-    if args.force_retranslate:
-        if segments_path.exists():
-            segments_path.unlink()
-        if translations_path.exists():
-            translations_path.unlink()
-        if checkpoint_path.exists():
-            checkpoint_path.unlink()
-
     try:
-        # Step 1: Extract segments
-        segment_count, t1_elapsed, cached = step_extract_segments(
-            input_pdf, output_dir, segments_path,
+        res = translate_book_pipeline(
+            input_pdf,
+            output_dir,
             target_language=args.target_language,
             source_language=args.source_language,
             pages=args.pages,
             threads=args.threads,
-            overwrite=args.overwrite or args.force_retranslate,
-        )
-
-        if segment_count == 0:
-            logger.info("No translatable segments found (all pages preserved, e.g. index/diagrams). Preserving PDF...")
-            dest_pdf = output_dir / f"{input_pdf.stem}-{args.target_language}.pdf"
-            import shutil
-            shutil.copyfile(input_pdf, dest_pdf)
-            logger.info("Preserved PDF copied to: %s", dest_pdf)
-            return 0
-
-        # Step 2: Translate segments
-        stats, t2_elapsed = step_translate_segments(
-            segments_path, output_dir, translations_path, checkpoint_path,
-            system_prompt=system_prompt,
-            glossary=glossary,
             concurrency=args.concurrency,
-            max_retries=args.max_retries,
             request_interval=args.request_interval,
             batch_size=args.batch_size,
-            force_retranslate=args.force_retranslate,
-        )
-
-        if args.skip_rebuild:
-            logger.info("Skipping PDF rebuild (--skip-rebuild)")
-            total_elapsed = time.perf_counter() - total_start
-            print(f"\n[Done] Step 2 complete in {t2_elapsed:.2f}s. Rebuild skipped.\n")
-            return 0
-
-        # Step 3: Rebuild PDF
-        result_path, t3_elapsed = step_rebuild_pdf(
-            input_pdf, output_dir, translations_path, still_missing_path,
-            target_language=args.target_language,
-            source_language=args.source_language,
-            pages=args.pages,
-            threads=args.threads,
+            max_retries=args.max_retries,
+            profile=args.profile,
+            system_prompt=args.system_prompt,
+            glossary=args.glossary,
             overwrite=args.overwrite,
+            force_retranslate=args.force_retranslate,
+            skip_rebuild=args.skip_rebuild,
         )
-
         total_elapsed = time.perf_counter() - total_start
         total_mins = int(total_elapsed // 60)
         total_secs = total_elapsed % 60
-
-        completed = stats.get("completed", 0)
-        failed = stats.get("failed", 0)
-        total_seg = stats.get("total", segment_count)
-        rate = (completed / t2_elapsed * 60) if t2_elapsed > 0 else 0
-
-        p1 = (t1_elapsed / total_elapsed * 100) if total_elapsed > 0 else 0
-        p2 = (t2_elapsed / total_elapsed * 100) if total_elapsed > 0 else 0
-        p3 = (t3_elapsed / total_elapsed * 100) if total_elapsed > 0 else 0
-
-        cache_str = "reused from cache" if cached else "extracted new"
-        rebuild_str = f"{result_path.name}" if result_path else "Failed"
-
-        timing_summary = [
-            "",
-            "=" * 74,
-            "                 STAGE EXECUTION TIMING & PERFORMANCE SUMMARY",
-            "=" * 74,
-            f"  • Step 1: Segment Extraction   : {t1_elapsed:7.2f}s ({p1:5.1f}%)  [{segment_count} segments ({cache_str})]",
-            f"  • Step 2: LLM Translation      : {t2_elapsed:7.2f}s ({p2:5.1f}%)  [{completed}/{total_seg} ok, {failed} fail, {rate:.1f} seg/min]",
-            f"  • Step 3: PDF Rebuild & Layout : {t3_elapsed:7.2f}s ({p3:5.1f}%)  [{rebuild_str}]",
-            "-" * 74,
-            f"  • Total End-to-End Elapsed     : {total_elapsed:7.2f}s (100.0%)  [{total_mins}m {total_secs:04.1f}s total]",
-            "=" * 74,
-            "",
-        ]
-        for line in timing_summary:
-            logger.info(line)
-            print(line)
-
-        # Final report
-        logger.info("=" * 60)
-        logger.info("TRANSLATION COMPLETE")
-        logger.info("Total segments: %d", stats.get("total", 0))
-        logger.info("Completed: %d", stats.get("completed", 0))
-        logger.info("Failed: %d", stats.get("failed", 0))
-        if result_path:
-            logger.info("Output PDF: %s", result_path)
-        logger.info("Checkpoint: %s", checkpoint_path)
-        logger.info("Translations: %s", translations_path)
-        logger.info("=" * 60)
-
+        logger.info("TRANSLATION COMPLETE in %dm %.1fs -> %s", total_mins, total_secs, res.path)
         return 0
-
     except TranslationError as e:
         logger.error("Translation error: %s", e)
         return 2

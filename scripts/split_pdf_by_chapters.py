@@ -7,7 +7,10 @@ import argparse
 import re
 import sys
 from pathlib import Path
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
 
 
 def extract_chapters_from_pdf(
@@ -42,11 +45,21 @@ def extract_chapters_from_pdf(
     for i, (lvl, title, start_page) in enumerate(major_entries):
         is_chapter = bool(
             re.match(r"^\d+\s*[-–]\s*", title)
-            or re.match(r"^Chapter\s+\d+", title, re.IGNORECASE)
+            or re.match(r"^(Chapter|Part|Section)\s+\w+", title, re.IGNORECASE)
+            or lvl == 1
         )
         is_index = bool(re.match(r"^Index\b", title, re.IGNORECASE))
         if is_chapter or is_index:
             chapters.append({"title": title, "start_page": start_page})
+
+    if not chapters and total_pages > 40:
+        # Fall back to page blocks if no chapter-level TOC detected
+        block_size = 35
+        for start in range(1, total_pages + 1, block_size):
+            chapters.append({
+                "title": f"Part {len(chapters) + 1}",
+                "start_page": start,
+            })
 
     # Deduplicate by start page
     unique_chapters = []

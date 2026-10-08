@@ -6,7 +6,10 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
 
 
 def merge_pdfs(pdf_paths: list[Path], output_pdf: Path) -> int:

@@ -584,12 +584,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.language.set(LANGUAGE_NAMES[DEFAULT_TARGET_LANGUAGE])
         self.language.grid(row=2, column=1, pady=(PAD // 2, GAP), sticky="w")
 
-        self.overwrite = ctk.CTkCheckBox(
-            controls, text="Ghi đè file cũ",
+        options_frame = ctk.CTkFrame(controls, fg_color="transparent")
+        options_frame.grid(row=2, column=2, padx=(PAD, PAD), pady=(PAD // 2, GAP), sticky="w")
+
+        self.split_chapters = ctk.CTkCheckBox(
+            options_frame, text="Tách chương (TOC)",
             checkbox_width=16, checkbox_height=16,
             font=ctk.CTkFont(self.ui_font, size=11),
         )
-        self.overwrite.grid(row=2, column=2, padx=(PAD, PAD), pady=(PAD // 2, GAP), sticky="w")
+        self.split_chapters.select()
+        self.split_chapters.pack(side="left", padx=(0, PAD))
+
+        self.overwrite = ctk.CTkCheckBox(
+            options_frame, text="Ghi đè",
+            checkbox_width=16, checkbox_height=16,
+            font=ctk.CTkFont(self.ui_font, size=11),
+        )
+        self.overwrite.pack(side="left")
 
         self.translate_button = ctk.CTkButton(
             controls, text="Dịch", width=120, height=36, corner_radius=8,
@@ -785,9 +796,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         profile_key = PROFILE_MAP.get(self.profile_menu.get(), "dental")
         model_name = self.model_menu.get()
 
+        split_chapters = bool(self.split_chapters.get())
         self.worker = threading.Thread(
             target=self._run,
-            args=(pending, language, overwrite, engine_choice, profile_key, model_name),
+            args=(pending, language, overwrite, engine_choice, profile_key, model_name, split_chapters),
             daemon=True,
         )
         self.worker.start()
@@ -800,6 +812,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         engine_choice: str = ENGINE_9ROUTER,
         profile_key: str = "dental",
         model_name: str = DEFAULT_MODEL,
+        split_chapters: bool = True,
     ) -> None:
         is_9router = (engine_choice == ENGINE_9ROUTER)
         profile_assets = load_profile(profile_key, APP_ROOT) if is_9router else None
@@ -814,22 +827,79 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         for index, path in enumerate(files, 1):
             self.events.put(("status", path, "running", "", None))
             destination = path.parent / "translated"
+            destination.mkdir(parents=True, exist_ok=True)
 
-            def report(done: int, total: int, _p: Path = path) -> None:
-                self.events.put(("page", _p, done, total))
+            # Strictly bind cache to destination directory (never outside the PDF's folder)
+            os.environ["PDF2ZH_CACHE_DIR"] = str(destination)
+            try:
+                from pdf2zh.cache import init_db
+                init_db(destination)
+            except Exception:
+                pass
 
             try:
-                result = translate_pdf(
-                    path,
-                    destination,
-                    target_language=language,
-                    overwrite=overwrite,
-                    engine="openai" if is_9router else "google",
-                    system_prompt=profile_assets.system_prompt if profile_assets else None,
-                    glossary=profile_assets.glossary if profile_assets else None,
-                    extra_envs=extra_envs,
-                    on_progress=report,
-                )
+                if is_9router and split_chapters:
+                    from scripts.translate_all_chapters import full_textbook_pipeline
+
+                    def report_textbook(stage: str, done: int, total: int, _p: Path = path) -> None:
+                        self.events.put(("stage_progress", _p, stage, done, total))
+
+                    result = full_textbook_pipeline(
+                        path,
+                        destination,
+                        target_language=language,
+                        profile=profile_key,
+                        system_prompt=profile_assets.system_prompt if profile_assets else None,
+                        glossary=profile_assets.glossary if profile_assets else None,
+                        extra_envs=extra_envs,
+                        concurrency=2,
+                        request_interval=0.2,
+                        overwrite=overwrite,
+                        on_progress=report_textbook,
+                    )
+                elif is_9router:
+                    from scripts.translate_book import translate_book_pipeline
+
+                    def report_book(stage: str, done: int, total: int, _p: Path = path) -> None:
+                        if stage == "extracting":
+                            msg = f"Trích xuất: {done}/{total} trang" if total else "Đang trích xuất văn bản…"
+                        elif stage == "translating":
+                            msg = f"Dịch: {done}/{total} đoạn" if total else "Đang dịch các đoạn…"
+                        elif stage == "rebuilding":
+                            msg = f"Ghép PDF: {done}/{total} trang" if total else "Đang ghép layout PDF…"
+                        else:
+                            msg = stage
+                        self.events.put(("stage_progress", _p, msg, done, total))
+
+                    result = translate_book_pipeline(
+                        path,
+                        destination,
+                        target_language=language,
+                        profile=profile_key,
+                        system_prompt=profile_assets.system_prompt if profile_assets else None,
+                        glossary=profile_assets.glossary if profile_assets else None,
+                        extra_envs=extra_envs,
+                        concurrency=2,
+                        request_interval=0.2,
+                        overwrite=overwrite,
+                        on_progress=report_book,
+                    )
+                else:
+                    def report(done: int, total: int, _p: Path = path) -> None:
+                        self.events.put(("page", _p, done, total))
+
+                    result = translate_pdf(
+                        path,
+                        destination,
+                        target_language=language,
+                        overwrite=overwrite,
+                        engine="google",
+                        system_prompt=profile_assets.system_prompt if profile_assets else None,
+                        glossary=profile_assets.glossary if profile_assets else None,
+                        extra_envs=extra_envs,
+                        on_progress=report,
+                    )
+
                 detail = (
                     f"{result.untranslated} đoạn chưa dịch được"
                     if result.untranslated
@@ -904,6 +974,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     self.rows[path].detail.configure(text=f"trang {done}/{total}")
                     self.progress.set((self.batch_done + done / total) / max(self.batch_total, 1))
                     self.status.configure(text=f"Đang dịch {path.name}   trang {done}/{total}")
+            elif event[0] == "stage_progress":
+                _, path, msg, done, total = event
+                if self.states.get(path) == "running":
+                    self._go_determinate()
+                    self.rows[path].detail.configure(text=msg)
+                    frac = (done / total) if (total and total > 0) else 0.0
+                    self.progress.set((self.batch_done + frac) / max(self.batch_total, 1))
+                    self.status.configure(text=f"{path.name} • {msg}")
             elif event[0] == "progress":
                 _, fraction, done_files, total_files = event
                 self.batch_done, self.batch_total = done_files, total_files
