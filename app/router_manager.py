@@ -6,13 +6,17 @@ OAuth/dashboard launcher, health checks, and active model discovery.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +26,85 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ROUTER_URL = "http://localhost:20128"
 DEFAULT_MODEL = "ag/gemini-3.8-flash-low"
+
+
+def _assign_process_to_job(pid: int) -> Any:
+    """Bind child process to a Windows Job Object with KILL_ON_JOB_CLOSE.
+
+    Guarantees the Windows kernel terminates node.exe and all its child
+    processes immediately whenever AegisTrans exits, even on sudden crash.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoCounters", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryLimit", ctypes.c_size_t),
+                ("PeakJobMemoryLimit", ctypes.c_size_t),
+            ]
+
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+        JobObjectExtendedLimitInformation = 9
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        success = kernel32.SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not success:
+            kernel32.CloseHandle(job)
+            return None
+
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_TERMINATE = 0x0001
+        h_proc = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if h_proc:
+            kernel32.AssignProcessToJobObject(job, h_proc)
+            kernel32.CloseHandle(h_proc)
+
+        return job
+    except Exception as e:
+        logger.debug("Could not assign process to Windows job object: %s", e)
+        return None
 
 
 def is_pe_binary(path: Path) -> bool:
@@ -44,6 +127,7 @@ class NineRouterManager:
         self,
         app_root: Path | None = None,
         base_url: str = DEFAULT_ROUTER_URL,
+        log_dir: Path | None = None,
     ) -> None:
         if app_root is None:
             self.app_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
@@ -52,8 +136,12 @@ class NineRouterManager:
 
         self.base_url = base_url.rstrip("/")
         self.api_url = f"{self.base_url}/v1"
+        self.log_dir = log_dir or (self.app_root / "logs")
+        self.log_file = None
         self.process: subprocess.Popen[Any] | None = None
         self.spawned_by_us: bool = False
+        self.job_handle: Any = None
+        atexit.register(self.shutdown)
 
     def find_command(self) -> tuple[list[str], bool] | None:
         """Resolve command args and shell mode to launch 9Router safely.
@@ -146,14 +234,33 @@ class NineRouterManager:
         try:
             creationflags = 0x08000000 if sys.platform == "win32" else 0
 
+            try:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                log_path = self.log_dir / "9router.log"
+                self.log_file = open(log_path, "a", encoding="utf-8")
+                self.log_file.write(
+                    f"\n{'=' * 60}\n"
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting 9Router: {' '.join(cmd_args)}\n"
+                    f"{'=' * 60}\n"
+                )
+                self.log_file.flush()
+                stdout_target = self.log_file
+                stderr_target = subprocess.STDOUT
+            except OSError as log_err:
+                logger.warning("Could not open 9router.log: %s", log_err)
+                stdout_target = subprocess.DEVNULL
+                stderr_target = subprocess.DEVNULL
+
             self.process = subprocess.Popen(
                 cmd_args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=stdout_target,
+                stderr=stderr_target,
                 creationflags=creationflags,
                 shell=use_shell,
             )
             self.spawned_by_us = True
+            if sys.platform == "win32" and getattr(self.process, "pid", None):
+                self.job_handle = _assign_process_to_job(self.process.pid)
 
             # Poll for readiness
             deadline = time.monotonic() + wait_seconds
@@ -161,9 +268,22 @@ class NineRouterManager:
                 if self.is_healthy(timeout=0.5):
                     logger.info("9Router started successfully.")
                     return True
+                exit_code = self.process.poll()
+                if isinstance(exit_code, int):
+                    logger.warning(
+                        "9Router process exited prematurely with code %s. Check %s for details.",
+                        exit_code,
+                        self.log_dir / "9router.log",
+                    )
+                    if self.log_file:
+                        try:
+                            self.log_file.flush()
+                        except OSError:
+                            pass
+                    break
                 time.sleep(0.3)
 
-            logger.warning("9Router process started but health check timed out.")
+            logger.warning("9Router process started but health check timed out. Check: %s", self.log_dir / "9router.log")
             return False
         except Exception as error:
             logger.error("Failed to launch 9Router: %s", error)
@@ -173,11 +293,52 @@ class NineRouterManager:
         """Open the 9Router web dashboard in the user's default browser."""
         webbrowser.open(self.base_url)
 
+    def get_data_dir(self) -> Path:
+        """Locate 9Router user data directory where SQLite database lives."""
+        if os.environ.get("DATA_DIR"):
+            return Path(os.environ["DATA_DIR"])
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+            return Path(appdata) / "9router"
+        return Path.home() / ".9router"
+
+    def get_api_key(self) -> str:
+        """Retrieve active API key from 9Router SQLite database, or create one if none exists."""
+        db_path = self.get_data_dir() / "db" / "data.sqlite"
+        if not db_path.is_file():
+            return "sk-aegistrans"
+
+        try:
+            with sqlite3.connect(db_path, timeout=5.0) as conn:
+                cur = conn.cursor()
+                # 1. Look for existing active API key
+                cur.execute("SELECT key FROM apiKeys WHERE isActive = 1 ORDER BY createdAt ASC")
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0]
+
+                # 2. No active key: insert an AegisTrans key so requireApiKey=true succeeds
+                key_id = str(uuid.uuid4())
+                new_key = f"sk-aegistrans-{uuid.uuid4().hex[:12]}"
+                now = datetime.now(timezone.utc).isoformat()
+                cur.execute(
+                    "INSERT INTO apiKeys (id, key, name, machineId, isActive, createdAt, accessRestricted, accessAllow) "
+                    "VALUES (?, ?, ?, ?, 1, ?, 0, '')",
+                    (key_id, new_key, "AegisTrans", "local", now),
+                )
+                conn.commit()
+                logger.info("Created AegisTrans API key in 9Router DB: %s", new_key)
+                return new_key
+        except Exception as error:
+            logger.debug("Could not resolve/create API key from 9Router DB: %s", error)
+            return "sk-aegistrans"
+
     def get_available_models(self, timeout: float = 2.0) -> list[str]:
         """Fetch list of available models from 9Router OpenAI-compatible endpoint."""
         models_url = f"{self.api_url}/models"
         try:
-            headers = {"Authorization": "Bearer 9router"}
+            api_key = self.get_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"}
             response = requests.get(models_url, headers=headers, timeout=timeout)
             if response.status_code == 200:
                 payload = response.json()
@@ -198,7 +359,8 @@ class NineRouterManager:
         # Attempt to inspect models endpoint
         models_url = f"{self.api_url}/models"
         try:
-            headers = {"Authorization": "Bearer 9router"}
+            api_key = self.get_api_key()
+            headers = {"Authorization": f"Bearer {api_key}"}
             response = requests.get(models_url, headers=headers, timeout=timeout)
             if response.status_code == 200:
                 payload = response.json()
@@ -211,18 +373,51 @@ class NineRouterManager:
 
     def shutdown(self) -> None:
         """Terminate the background 9Router process if we were the one that started it."""
-        if not self.spawned_by_us or not self.process:
-            return
+        if self.spawned_by_us and self.process:
+            logger.info("Stopping background 9Router process...")
 
-        logger.info("Stopping background 9Router process...")
-        try:
-            self.process.terminate()
+            # 1. Graceful HTTP shutdown signal
             try:
-                self.process.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-        except Exception as error:
-            logger.warning("Error stopping 9Router process: %s", error)
-        finally:
-            self.process = None
-            self.spawned_by_us = False
+                requests.post(f"{self.base_url}/api/version/shutdown", timeout=0.8)
+            except Exception:
+                pass
+
+            # 2. Forcefully kill the entire process tree on Windows (PID + children)
+            if sys.platform == "win32" and getattr(self.process, "pid", None):
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(self.process.pid)],
+                        capture_output=True,
+                        timeout=3.0,
+                    )
+                except Exception as taskkill_err:
+                    logger.debug("taskkill error: %s", taskkill_err)
+
+            # 3. Always invoke terminate() on process handle
+            try:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2.0)
+                except (subprocess.TimeoutExpired, Exception):
+                    self.process.kill()
+            except Exception as error:
+                logger.warning("Error stopping 9Router process: %s", error)
+            finally:
+                self.process = None
+                self.spawned_by_us = False
+
+        if self.job_handle:
+            try:
+                import ctypes
+
+                ctypes.windll.kernel32.CloseHandle(self.job_handle)
+            except Exception:
+                pass
+            self.job_handle = None
+
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except OSError:
+                pass
+            self.log_file = None

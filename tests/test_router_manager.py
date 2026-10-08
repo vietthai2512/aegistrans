@@ -133,6 +133,27 @@ class TestNineRouterManager(unittest.TestCase):
         self.assertIsNone(self.manager.process)
         self.assertFalse(self.manager.spawned_by_us)
 
+    def test_get_api_key_creates_and_finds_key(self) -> None:
+        import sqlite3
+
+        db_dir = self.app_root / "db"
+        db_dir.mkdir(parents=True)
+        db_file = db_dir / "data.sqlite"
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                "CREATE TABLE apiKeys (id TEXT PRIMARY KEY, key TEXT UNIQUE, name TEXT, machineId TEXT, isActive INTEGER, createdAt TEXT, accessRestricted INTEGER, accessAllow TEXT)"
+            )
+            conn.commit()
+
+        with mock.patch.object(NineRouterManager, "get_data_dir", return_value=self.app_root):
+            # First call creates a new key
+            created_key = self.manager.get_api_key()
+            self.assertTrue(created_key.startswith("sk-aegistrans-"))
+
+            # Second call retrieves the existing active key
+            retrieved_key = self.manager.get_api_key()
+            self.assertEqual(created_key, retrieved_key)
+
 
 if __name__ == "__main__":
     unittest.main()

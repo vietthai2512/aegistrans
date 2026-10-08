@@ -8,9 +8,12 @@ handoff engine is reachable from the skill rather than from here.
 from __future__ import annotations
 
 import ctypes
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import sys
+import tempfile
 import threading
 import tkinter
 import traceback
@@ -84,6 +87,95 @@ MUTED = ("gray45", "gray60")
 SURFACE = ("gray92", "gray17")
 HOVER = ("gray86", "gray23")
 BORDER_IDLE = ("gray75", "gray30")
+
+
+def get_log_dir() -> Path:
+    """Determine the folder for application and runtime logs."""
+    candidate = Path(sys.executable).parent / "logs" if getattr(sys, "frozen", False) else APP_ROOT / "logs"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        probe = candidate / ".write_test"
+        probe.touch()
+        probe.unlink()
+        return candidate
+    except OSError:
+        pass
+    fallback = Path(tempfile.gettempdir()) / "aegistrans_logs"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+LOG_DIR = get_log_dir()
+
+
+class _DualStream:
+    """Writes to both original stream and persistent log file."""
+
+    def __init__(self, original, file_handle):
+        self.original = original
+        self.file_handle = file_handle
+
+    def write(self, data):
+        if self.file_handle:
+            try:
+                self.file_handle.write(data)
+                self.file_handle.flush()
+            except Exception:
+                pass
+        if self.original and hasattr(self.original, "write"):
+            try:
+                self.original.write(data)
+                self.original.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        if self.file_handle:
+            try:
+                self.file_handle.flush()
+            except Exception:
+                pass
+        if self.original and hasattr(self.original, "flush"):
+            try:
+                self.original.flush()
+            except Exception:
+                pass
+
+
+def setup_application_logging() -> Path:
+    """Initialize rotating file logger and pipe stdout/stderr into aegistrans.log."""
+    log_file = LOG_DIR / "aegistrans.log"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # 5MB per log file, keep 2 backups
+    file_handler = RotatingFileHandler(
+        str(log_file), maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+    )
+    file_handler.setFormatter(
+        logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s", "%Y-%m-%d %H:%M:%S")
+    )
+    root_logger.addHandler(file_handler)
+
+    def handle_exception(exc_type, exc_val, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_val, exc_tb)
+            return
+        root_logger.critical("Uncaught GUI exception", exc_info=(exc_type, exc_val, exc_tb))
+
+    sys.excepthook = handle_exception
+
+    try:
+        stream_handle = open(log_file, "a", encoding="utf-8")
+        sys.stdout = _DualStream(sys.stdout, stream_handle)
+        sys.stderr = _DualStream(sys.stderr, stream_handle)
+    except OSError:
+        pass
+
+    root_logger.info("=" * 60)
+    root_logger.info("AegisTrans v%s started. Logs at %s", APP_VERSION, LOG_DIR)
+    root_logger.info("=" * 60)
+    return log_file
 
 
 def ensure_writable_streams() -> None:
@@ -240,7 +332,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._center(780, 720)
         self._set_window_icon()
 
-        self.router_manager = NineRouterManager(APP_ROOT)
+        self.router_manager = NineRouterManager(APP_ROOT, log_dir=LOG_DIR)
         self.router_models = [DEFAULT_MODEL]
 
         self.files: list[Path] = []
@@ -350,10 +442,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.update_link.bind("<Button-1>", lambda _event: webbrowser.open(RELEASES_PAGE))
         self.update_link.grid_remove()
 
+        version_frame = ctk.CTkFrame(header, fg_color="transparent")
+        version_frame.grid(row=1, column=2, sticky="ne")
+
         ctk.CTkLabel(
-            header, text=f"v{APP_VERSION}", anchor="e",
+            version_frame, text=f"v{APP_VERSION}  •  ", anchor="e",
             font=ctk.CTkFont(self.ui_font, size=11), text_color=MUTED,
-        ).grid(row=1, column=2, sticky="ne")
+        ).pack(side="left")
+
+        logs_link = ctk.CTkLabel(
+            version_frame, text="Nhật ký (Logs)", anchor="e", cursor="hand2",
+            font=ctk.CTkFont(self.ui_font, size=11, underline=True), text_color=ACCENT,
+        )
+        logs_link.pack(side="left")
+        logs_link.bind("<Button-1>", lambda _event: self._open(LOG_DIR))
 
     def _build_dropzone(self) -> None:
         self.dropzone = ctk.CTkFrame(
@@ -705,7 +807,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if is_9router:
             extra_envs = {
                 "llm_base_url": self.router_manager.api_url,
-                "llm_api_key": "9router",
+                "llm_api_key": self.router_manager.get_api_key(),
                 "llm_model": model_name,
             }
 
@@ -856,6 +958,7 @@ def main() -> None:
     # A frozen bar reads as a hung app, which is the opposite of what it is for.
     sys.setswitchinterval(0.0005)
     ensure_writable_streams()
+    setup_application_logging()
     use_bundled_assets()
     ctk.set_appearance_mode("system")
     ctk.set_default_color_theme("blue")
@@ -863,7 +966,13 @@ def main() -> None:
     # Windows passes anything dropped on the executable icon as arguments.
     if sys.argv[1:]:
         app._add([Path(argument) for argument in sys.argv[1:]])
-    app.mainloop()
+    try:
+        app.mainloop()
+    finally:
+        try:
+            app.router_manager.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
